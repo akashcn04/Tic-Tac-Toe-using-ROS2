@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from turtlesim.msg import Pose
+from geometry_msgs.msg import Twist
+from turtlesim.srv import TeleportAbsolute, SetPen
+import time
+import math
+import threading
+import sys
+import termios
+import tty
+
+class TicTacToeGameNode(Node):
+    def __init__(self):
+        super().__init__('tic_tac_toe_game')
+        
+        # Create publishers
+        self.cmd_vel_pub = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
+        
+        # Create subscribers
+        self.pose_sub = self.create_subscription(
+            Pose,
+            '/turtle1/pose',
+            self.pose_callback,
+            10)
+        
+        # Create service clients
+        self.teleport_client = self.create_client(TeleportAbsolute, '/turtle1/teleport_absolute')
+        self.set_pen_client = self.create_client(SetPen, '/turtle1/set_pen')
+        
+        # Wait for services to be available
+        while not self.teleport_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Teleport service not available, waiting...')
+        while not self.set_pen_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Set pen service not available, waiting...')
+            
+        # Initialize game state
+        self.board = [' ' for _ in range(9)]
+        self.current_player = 'X'  # X = human, O = computer
+        self.game_active = True
+        self.pose = None
+        
+        # Cell positions (center of each cell)
+        self.cell_positions = [
+            (3.0, 9.0), (5.5, 9.0), (8.0, 9.0),  # Top row
+            (3.0, 6.5), (5.5, 6.5), (8.0, 6.5),  # Middle row
+            (3.0, 4.0), (5.5, 4.0), (8.0, 4.0)   # Bottom row
+        ]
+        
+        # Configure initial turtle state
+        self.teleport_turtle(5.5, 7.5, 0.0)  # Start position
+        self.set_pen(False)  # Lift pen initially
+        
+        # Start keyboard input thread
+        self.running = True
+        self.input_thread = threading.Thread(target=self.get_keyboard_input)
+        self.input_thread.daemon = True
+        self.input_thread.start()
+        
+        # Create the main game loop timer
+        self.timer = self.create_timer(0.1, self.game_loop)
+        
+        self.get_logger().info('Tic Tac Toe game started!')
+        self.get_logger().info('Use WASD keys to move: w=up, a=left, s=down, d=right')
+        self.get_logger().info('Press m to mark a cell with X')
+        self.get_logger().info('Press r to reset the game')
+        self.get_logger().info('Press q to quit')
+    
+    def get_keyboard_input(self):
+        while self.running:
+            key = self.get_key()
+            
+            if not self.game_active and key.lower() == 'r':
+                self.reset_game()
+            
+            if not self.game_active or self.current_player != 'X':
+                time.sleep(0.1)
+                continue
+                
+            if key.lower() == 'w':  # up
+                self.move_turtle(0.0, 1.0)
+            elif key.lower() == 's':  # down
+                self.move_turtle(0.0, -1.0)
+            elif key.lower() == 'a':  # left
+                self.move_turtle(-1.0, 0.0)
+            elif key.lower() == 'd':  # right
+                self.move_turtle(1.0, 0.0)
+            elif key.lower() == 'm' or key == ' ':  # mark (support both m and space)
+                self.handle_player_move()
+            elif key.lower() == 'q':  # quit
+                self.running = False
+                self.get_logger().info("Quitting...")
+                rclpy.shutdown()
+                break
+                
+            time.sleep(0.1)  # Small delay to prevent flooding
+    
+    def get_key(self):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+    
+    def pose_callback(self, msg):
+        self.pose = msg
+        
+    def teleport_turtle(self, x, y, theta):
+        request = TeleportAbsolute.Request()
+        request.x = float(x)
+        request.y = float(y)
+        request.theta = float(theta)
+        future = self.teleport_client.call_async(request)
+        # Wait for the teleport to complete
+        time.sleep(0.2)
+        
+    def set_pen(self, pen_on, r=255, g=255, b=255, width=3):
+        request = SetPen.Request()
+        request.r = r
+        request.g = g
+        request.b = b
+        request.width = width
+        request.off = 0 if pen_on else 1
+        future = self.set_pen_client.call_async(request)
+        # Wait for the pen setting to complete
+        time.sleep(0.2)
+        
+    def move_turtle(self, x_dir, y_dir):
+        if self.pose is None:
+            return
+            
+        # Create velocity command
+        vel_msg = Twist()
+        vel_msg.linear.x = float(x_dir)
+        vel_msg.linear.y = float(y_dir)
+        self.cmd_vel_pub.publish(vel_msg)
+        
+        # Stop the turtle after a short movement
+        time.sleep(0.3)
+        vel_msg = Twist()
+        self.cmd_vel_pub.publish(vel_msg)
+        
+    def get_current_cell(self):
+        if self.pose is None:
+            return None
+            
+        # Find the closest cell to current position
+        for i, (x, y) in enumerate(self.cell_positions):
+            if abs(self.pose.x - x) < 1.5 and abs(self.pose.y - y) < 1.5:
+                return i
+        return None
+        
+    def handle_player_move(self):
+        if self.current_player != 'X' or not self.game_active:
+            return
+            
+        cell = self.get_current_cell()
+        if cell is not None and self.board[cell] == ' ':
+            # Mark the cell with X
+            self.board[cell] = 'X'
+            self.draw_x(cell)
+            
+            # Check for win
+            if self.check_winner():
+                self.get_logger().info('Player X wins!')
+                self.game_active = False
+                return
+                
+            # Check for draw
+            if ' ' not in self.board:
+                self.get_logger().info('Game ended in a draw!')
+                self.game_active = False
+                return
+                
+            # Switch to computer turn
+            self.current_player = 'O'
+            self.get_logger().info("Computer's turn...")
+        
+    def draw_x(self, cell_idx):
+        x, y = self.cell_positions[cell_idx]
+        size = 1.0  # Size of the X
+        
+        # Draw first diagonal
+        self.set_pen(False)  # Make sure the pen is up before teleporting
+        self.teleport_turtle(x - size/2, y - size/2, 0.0)
+        self.set_pen(True, 255, 0, 0)  # Red for X
+        self.teleport_turtle(x + size/2, y + size/2, 0.0)
+        
+        # Draw second diagonal
+        self.set_pen(False)  # Lift pen before teleporting
+        self.teleport_turtle(x + size/2, y - size/2, 0.0)
+        self.set_pen(True, 255, 0, 0)
+        self.teleport_turtle(x - size/2, y + size/2, 0.0)
+        
+        # Lift pen when done
+        self.set_pen(False)
+        
+    def draw_o(self, cell_idx):
+        cx, cy = self.cell_positions[cell_idx]
+        radius = 0.5
+        
+        # Lift pen before moving to starting point
+        self.set_pen(False)
+        
+        # Draw circle with more steps for smoothness
+        steps = 36  # Increased from 12 for smoother circle
+        
+        # First move to starting point without drawing
+        angle = 0
+        x = cx + radius * math.cos(angle)
+        y = cy + radius * math.sin(angle)
+        self.teleport_turtle(x, y, 0.0)
+        
+        # Now set pen down to start drawing
+        self.set_pen(True, 0, 0, 255)  # Blue for O
+        
+        # Draw the circle
+        for i in range(1, steps + 1):
+            angle = 2 * math.pi * i / steps
+            x = cx + radius * math.cos(angle)
+            y = cy + radius * math.sin(angle)
+            self.teleport_turtle(x, y, 0.0)
+        
+        # Lift pen when done
+        self.set_pen(False)
+        
+        # Return to center of cell
+        self.teleport_turtle(cx, cy, 0.0)
+        
+    def make_computer_move(self):
+        if not self.game_active:
+            return
+            
+        # Simple AI to find best move
+        # First check if computer can win
+        for i in range(9):
+            if self.board[i] == ' ':
+                self.board[i] = 'O'  # Try move
+                if self.check_winner() == 'O':
+                    # Winning move found
+                    self.draw_o(i)
+                    self.get_logger().info('Computer wins!')
+                    self.game_active = False
+                    return
+                self.board[i] = ' '  # Undo move
+                
+        # Check if player can win and block
+        for i in range(9):
+            if self.board[i] == ' ':
+                self.board[i] = 'X'  # Try move
+                if self.check_winner() == 'X':
+                    # Blocking move
+                    self.board[i] = 'O'
+                    self.draw_o(i)
+                    self.current_player = 'X'
+                    return
+                self.board[i] = ' '  # Undo move
+                
+        # Take center if available
+        if self.board[4] == ' ':
+            self.board[4] = 'O'
+            self.draw_o(4)
+            self.current_player = 'X'
+            return
+            
+        # Take a corner if available
+        for i in [0, 2, 6, 8]:
+            if self.board[i] == ' ':
+                self.board[i] = 'O'
+                self.draw_o(i)
+                self.current_player = 'X'
+                return
+                
+        # Take any available space
+        for i in range(9):
+            if self.board[i] == ' ':
+                self.board[i] = 'O'
+                self.draw_o(i)
+                self.current_player = 'X'
+                return
+                
+        # If board is full
+        self.get_logger().info('Game ended in a draw!')
+        self.game_active = False
+        
+    def check_winner(self):
+        # Check all winning combinations
+        # Rows
+        for i in range(0, 9, 3):
+            if self.board[i] == self.board[i+1] == self.board[i+2] != ' ':
+                return self.board[i]
+                
+        # Columns
+        for i in range(3):
+            if self.board[i] == self.board[i+3] == self.board[i+6] != ' ':
+                return self.board[i]
+                
+        # Diagonals
+        if self.board[0] == self.board[4] == self.board[8] != ' ':
+            return self.board[0]
+        if self.board[2] == self.board[4] == self.board[6] != ' ':
+            return self.board[2]
+            
+        return None
+        
+    def reset_game(self):
+        self.board = [' ' for _ in range(9)]
+        self.current_player = 'X'
+        self.game_active = True
+        self.teleport_turtle(5.5, 7.5, 0.0)  # Reset position
+        self.get_logger().info('Game reset! Your turn (X)')
+        
+    def game_loop(self):
+        if not self.game_active:
+            return
+            
+        # Handle computer turn
+        if self.current_player == 'O':
+            time.sleep(1.0)  # Small delay before computer moves
+            self.make_computer_move()
+            
+            # Check for win after computer move
+            if self.check_winner() == 'O':
+                self.get_logger().info('Computer wins!')
+                self.game_active = False
+            # Check for draw after computer move
+            elif ' ' not in self.board:
+                self.get_logger().info('Game ended in a draw!')
+                self.game_active = False
+            
+            if self.game_active:
+                self.get_logger().info('Your turn!')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TicTacToeGameNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
