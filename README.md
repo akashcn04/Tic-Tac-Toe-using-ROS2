@@ -10,7 +10,7 @@ colcon build --packages-select tic_tac_toe<br>
 source install/setup.bash<br>
 
 2)<br>
-Darshan D Boss Pes: ros2 run turtlesim turtlesim_node<br>
+ros2 run turtlesim turtlesim_node<br>
 
 3)<br>
-Darshan D Boss Pes: python3 ~/catkin_ws/ros2_ws/src/tic_tac_toe/tic_tac_toe/game_logic_node.py<br>
+python3 ~/catkin_ws/ros2_ws/src/tic_tac_toe/tic_tac_toe/game_logic_node.py<br>
